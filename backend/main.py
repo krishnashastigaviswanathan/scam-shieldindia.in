@@ -28,9 +28,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# The dashboard is stored at the repository root, alongside the backend directory.
 FRONTEND_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "frontend",
     "index.html"
 )
 
