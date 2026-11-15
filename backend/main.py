@@ -1,193 +1,153 @@
 import os
 import sys
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from typing import Optional
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-# Ensure current directory is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from database import init_db, add_or_update_flag, get_intel_for_indicators, get_trending_threats
-from upi_sms_scanner import scan_message
 from ai_persona import analyze_scam_persona
+from database import add_or_update_flag, get_intel_for_indicators, get_trending_threats, init_db
+from image_qr_scanner import MAX_IMAGE_BYTES, scan_image
+from upi_sms_scanner import scan_message
 
 app = FastAPI(
     title="PhishGuard India API",
-    description="AI-Powered Phishing & Regional UPI/SMS Scam Analyzer with Crowdsourced Threat Intelligence",
-    version="1.0.0"
+    description="AI-powered phishing, QR and Indian UPI/SMS scam analysis with community threat intelligence.",
+    version="1.1.0",
 )
-
-# CORS middleware for open accessibility
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
-# The dashboard is stored at the repository root, alongside the backend directory.
-FRONTEND_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "index.html"
-)
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FRONTEND_PATH = os.path.join(ROOT, "frontend", "index.html")
 
 
-# Initialize Database
 @app.on_event("startup")
 def startup_event():
     init_db()
 
 
-# Pydantic Schemas
 class AnalyzeRequest(BaseModel):
-    message: Optional[str] = Field(default="", description="Raw message, SMS, email, or URL text to analyze")
-    sender: Optional[str] = Field(default=None, description="Optional sender header or phone number (e.g. AD-HDFCBK, +919876543210)")
+    message: Optional[str] = Field(default="", description="SMS, email, UPI text, or URL to analyze")
+    sender: Optional[str] = Field(default=None, description="Optional SMS sender ID or phone number")
 
 
 class FlagRequest(BaseModel):
-    indicator_type: str = Field(..., description="Indicator type: 'msg_hash', 'upi_id', or 'url'")
-    indicator_value: str = Field(default="", description="Indicator value")
-    scam_category: str = Field(
-        default="General Phishing / Scam",
-        description="Category: 'Fake Bank / KYC Scam', 'UPI Collect / Refund Fraud', 'Digital Arrest / TRAI Scam', 'Electricity / e-Challan Scam', 'Job / Lottery Scam', or 'False Positive (Safe)'"
-    )
-    is_safe: bool = Field(default=False, description="True if community user is voting this as a safe false positive")
+    indicator_type: str
+    indicator_value: str = Field(min_length=1, max_length=2048)
+    scam_category: str = "General Phishing / Scam"
+    is_safe: bool = False
+
+
+def analyze_text(message: str, sender: Optional[str] = None) -> dict:
+    message = message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Provide message text or a QR payload to analyze.")
+    scan = scan_message(message, sender.strip() if sender and sender.strip() else None)
+    indicators = [{"type": "msg_hash", "value": scan["msg_hash"]}]
+    indicators.extend({"type": "upi_id", "value": value} for value in scan["upi"]["upi_ids"])
+    indicators.extend({"type": "url", "value": value} for value in scan["urls"]["urls"])
+    matched = get_intel_for_indicators(indicators)
+    flags = sum(row.get("flag_count", 0) for row in matched)
+    safe_votes = sum(row.get("safe_votes", 0) for row in matched)
+    categories = list(dict.fromkeys(
+        row["scam_category"] for row in matched
+        if row.get("scam_category") and row["scam_category"] != "False Positive (Safe)"
+    ))
+
+    score = scan["base_score"] + min(30, flags * 5)
+    if safe_votes > flags:
+        score = max(5, score - min(35, (safe_votes - flags) * 8))
+    score = max(3, min(99, score))
+    if score >= 80:
+        verdict, level = "CRITICAL THREAT", "CRITICAL"
+    elif score >= 50:
+        verdict, level = "HIGH RISK SCAM", "HIGH"
+    elif score >= 25:
+        verdict, level = "SUSPICIOUS ACTIVITY", "SUSPICIOUS"
+    else:
+        verdict, level = "SAFE / LOW RISK", "SAFE"
+
+    flaggable = [{"type": "msg_hash", "value": scan["msg_hash"], "label": f"Message fingerprint · {scan['msg_hash']}"}]
+    flaggable.extend({"type": "upi_id", "value": value, "label": f"UPI ID · {value}"} for value in scan["upi"]["upi_ids"])
+    flaggable.extend({"type": "url", "value": value, "label": f"URL · {value}"} for value in scan["urls"]["urls"])
+    return {
+        "verdict": verdict,
+        "risk_score": score,
+        "risk_level": level,
+        "primary_category": categories[0] if categories else scan["primary_category"],
+        "msg_hash": scan["msg_hash"],
+        "scanner_details": scan,
+        "community_intel": {
+            "has_prior_reports": flags > 0,
+            "total_flags": flags,
+            "total_safe_votes": safe_votes,
+            "matched_indicators": matched,
+            "community_categories": categories,
+        },
+        "ai_persona": analyze_scam_persona(message, scan),
+        "flaggable_indicators": flaggable,
+    }
 
 
 @app.get("/")
 def serve_dashboard():
-    """Serves the single self-contained dark-mode SOC dashboard directly."""
-    if os.path.exists(FRONTEND_PATH):
-        return FileResponse(FRONTEND_PATH, media_type="text/html")
-    raise HTTPException(status_code=404, detail="Dashboard frontend not found.")
+    if not os.path.isfile(FRONTEND_PATH):
+        raise HTTPException(status_code=404, detail="Dashboard frontend not found.")
+    return FileResponse(FRONTEND_PATH, media_type="text/html")
 
 
 @app.post("/analyze")
 def analyze_threat(payload: AnalyzeRequest):
-    """
-    Analyzes message through:
-    1. Regional Indian regex and privacy SHA-256 fingerprinting
-    2. Crowdsourced threat intelligence lookups in threats.db
-    3. AI Scam Persona reverse-engineering (Ollama llama3.2 with heuristic fallback)
-    """
-    raw_msg = (payload.message or "").strip()
-    message = raw_msg if raw_msg else "General inquiry / unpopulated payload"
-    sender = payload.sender.strip() if payload.sender and payload.sender.strip() else None
+    return analyze_text(payload.message or "", payload.sender)
 
-    # Step 1: Regional Rule & Heuristic Scanner
-    scan_res = scan_message(message, sender)
 
-    # Step 2: Query Crowdsourced Threat Database
-    indicators_to_check = [{"type": "msg_hash", "value": scan_res["msg_hash"]}]
-
-    for upi in scan_res["upi"]["upi_ids"]:
-        indicators_to_check.append({"type": "upi_id", "value": upi})
-
-    for url in scan_res["urls"]["urls"]:
-        indicators_to_check.append({"type": "url", "value": url})
-
-    matched_intel = get_intel_for_indicators(indicators_to_check)
-
-    total_flags = sum(item.get("flag_count", 0) for item in matched_intel)
-    total_safe = sum(item.get("safe_votes", 0) for item in matched_intel)
-
-    reported_categories = list(set(
-        item.get("scam_category") for item in matched_intel if item.get("scam_category") and item.get("scam_category") != "False Positive (Safe)"
-    ))
-
-    # Step 3: Combine Rule Score with Community Intelligence
-    raw_score = scan_res["base_score"]
-
-    if total_flags > 0:
-        boost = min(30, total_flags * 5)
-        raw_score += boost
-
-    if total_safe > 0 and total_safe > total_flags:
-        reduction = min(35, (total_safe - total_flags) * 8)
-        raw_score = max(5, raw_score - reduction)
-
-    final_score = max(3, min(99, raw_score))
-
-    # Determine Verdict
-    if final_score >= 80:
-        verdict = "CRITICAL THREAT"
-        risk_level = "CRITICAL"
-    elif final_score >= 50:
-        verdict = "HIGH RISK SCAM"
-        risk_level = "HIGH"
-    elif final_score >= 25:
-        verdict = "SUSPICIOUS ACTIVITY"
-        risk_level = "SUSPICIOUS"
-    else:
-        verdict = "SAFE / LOW RISK"
-        risk_level = "SAFE"
-
-    # Step 4: AI Persona Reverse-Engineering
-    persona = analyze_scam_persona(message, scan_res)
-
-    # Compile flaggable indicators list for easy frontend voting
-    flaggable = [{"type": "msg_hash", "value": scan_res["msg_hash"], "label": f"Message Fingerprint ({scan_res['msg_hash']})"}]
-    for u in scan_res["upi"]["upi_ids"]:
-        flaggable.append({"type": "upi_id", "value": u, "label": f"UPI VPA: {u}"})
-    for link in scan_res["urls"]["urls"]:
-        flaggable.append({"type": "url", "value": link, "label": f"URL: {link}"})
-
-    return {
-        "verdict": verdict,
-        "risk_score": final_score,
-        "risk_level": risk_level,
-        "primary_category": reported_categories[0] if reported_categories else scan_res["primary_category"],
-        "msg_hash": scan_res["msg_hash"],
-        "scanner_details": scan_res,
-        "community_intel": {
-            "has_prior_reports": total_flags > 0,
-            "total_flags": total_flags,
-            "total_safe_votes": total_safe,
-            "matched_indicators": matched_intel,
-            "community_categories": reported_categories
-        },
-        "ai_persona": persona,
-        "flaggable_indicators": flaggable
-    }
+@app.post("/analyze-image")
+async def analyze_image(file: UploadFile = File(...), sender: Optional[str] = Form(default=None)):
+    suffix = os.path.splitext(file.filename or "")[1].lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise HTTPException(status_code=415, detail="Upload a PNG, JPG, JPEG, or WEBP image.")
+    data = await file.read(MAX_IMAGE_BYTES + 1)
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image is too large. Maximum upload size is 10 MB.")
+    try:
+        extracted = scan_image(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    combined = "\n".join(part for part in [extracted["ocr_text"], *extracted["qr_payloads"]] if part)
+    if not combined:
+        raise HTTPException(status_code=422, detail=extracted["notice"] or "No readable text or QR code was found in the image.")
+    report = analyze_text(combined, sender)
+    report["image_findings"] = extracted
+    return report
 
 
 @app.post("/flag")
 def flag_threat(payload: FlagRequest):
-    """
-    Submits user crowdsourced threat confirmation or votes safe (False Positive).
-    """
     valid_types = {"msg_hash", "upi_id", "url"}
     if payload.indicator_type not in valid_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid indicator_type '{payload.indicator_type}'. Must be one of {valid_types}"
-        )
-
+        raise HTTPException(status_code=400, detail=f"indicator_type must be one of {sorted(valid_types)}")
+    if not payload.is_safe and not payload.scam_category.strip():
+        raise HTTPException(status_code=400, detail="Select a scam category.")
     updated = add_or_update_flag(
-        indicator_type=payload.indicator_type,
-        indicator_value=payload.indicator_value,
-        scam_category=payload.scam_category,
-        is_safe=payload.is_safe
+        payload.indicator_type,
+        payload.indicator_value,
+        payload.scam_category,
+        payload.is_safe,
     )
-
-    return {
-        "status": "success",
-        "message": "Threat intelligence recorded successfully.",
-        "record": updated
-    }
+    return {"status": "success", "message": "Community report recorded.", "record": updated}
 
 
 @app.get("/trending")
 def trending_threats():
-    """
-    Returns top 5 most-flagged threat indicators for the live sidebar feed.
-    """
-    trending = get_trending_threats(limit=5)
-    return {
-        "status": "success",
-        "count": len(trending),
-        "threats": trending
-    }
+    threats = get_trending_threats(limit=5)
+    return {"status": "success", "count": len(threats), "threats": threats}
